@@ -1,0 +1,19 @@
+# Local install artifacts — never commit these.
+/build
+/release-info
+.app_secret
+app-crons.json
+installed.json
+data/
+
+# Preview harness — dev-only, never shipped with the app.
+/_preview
+
+# Local Kiro CLI settings — machine-specific, not part of the app.
+/.kiro
+
+# Python
+__pycache__/
+*.pyc
+
+.DS_Store

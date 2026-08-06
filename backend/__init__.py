@@ -1,0 +1,1 @@
+"""Icon Studio app backend."""

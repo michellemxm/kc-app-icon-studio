@@ -1,0 +1,54 @@
+{
+  "name": "icon-studio",
+  "displayName": "Icon Studio",
+  "version": "0.1.0",
+  "description": "Generate icon sets from a parameter list — original metaphors, hand-authored SVG, and a real-size contact sheet that proves each icon works before you ship it.",
+  "author": "mxiaomen",
+  "tags": ["design", "icons", "svg", "design-system"],
+  "highlights": [
+    "Describe the behaviour, not the picture — the agent proposes three structurally different metaphors before it draws",
+    "Every icon is hand-authored SVG on a half-pixel grid, not traced or pulled from a library",
+    "A contact sheet renders every icon at its real target size in light and dark, so nothing ships unverified",
+    "A per-workspace metaphor ledger stops two icons in a set from resolving to the same silhouette"
+  ],
+  "defaultEnabled": false,
+  "platform": {
+    "os": ["macos", "linux"]
+  },
+  "agents": [
+    "agents/icon-designer.json"
+  ],
+  "skills": [
+    "skills/icon-craft"
+  ],
+  "permissions": {
+    "api": [
+      "/api/apps/icon-studio",
+      "/api/apps/icon-studio/*",
+      "/api/chat",
+      "/api/chat/*",
+      "/api/file-read"
+    ],
+    "storage": true,
+    "network": false
+  },
+  "backend": {
+    "hooks": {
+      "routes": "backend.routes:register_routes"
+    }
+  },
+  "ui": {
+    "entry": "index.mjs",
+    "pages": [
+      {
+        "route": "/icon-studio",
+        "label": "Icon Studio",
+        "iconUrl": "icon.svg"
+      }
+    ]
+  },
+  "setup": {
+    "onInstall": "scripts/install.sh",
+    "onUninstall": "scripts/uninstall.sh"
+  }
+}
