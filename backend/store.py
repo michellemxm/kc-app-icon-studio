@@ -14,16 +14,27 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .contact_sheet import job_dir, ledger_path, proof_path, state_path, workspace_dir
+from .contact_sheet import (
+    data_home,
+    ledger_path,
+    proof_path,
+    render_dir,
+    state_path,
+    workspace_dir,
+)
 
 VALID_MODES = ("ship", "concepts")
 VALID_STYLES = ("outline", "filled")
 VALID_KEYLINES = ("square", "circle")
+#: ``new`` diverges on metaphors; ``redraw`` re-renders the library's existing
+#: icons at changed parameters and must NOT re-diverge -- see :func:`compose_brief`.
+VALID_JOB_KINDS = ("new", "redraw")
 MAX_NAMES = 24
 MAX_LIBRARIES = 40
 
@@ -106,6 +117,165 @@ def _migrate(state: dict[str, Any]) -> bool:
     return True
 
 
+# --- output folders -------------------------------------------------------------
+#
+# Every library owns a folder on disk holding its SVGs, flat, one file per icon
+# name. Flat rather than per-job is a requirement, not a preference: a redraw
+# overwrites an icon in place, which needs exactly one canonical location per
+# name. The default sits under the Kiro Crew workspace so a new library needs no
+# decision from the user; they can repoint it at any local folder afterwards.
+
+
+def libraries_root() -> Path:
+    """Default parent for library output folders."""
+    return workspace_dir() / "libraries"
+
+
+def library_output_dir(library: dict[str, Any]) -> Path:
+    """The folder a library's icons live in, falling back to the default.
+
+    Libraries created before output paths existed have no ``outputPath``; deriving
+    the default from the name keeps them readable instead of blank.
+    """
+    raw = str((library or {}).get("outputPath") or "")
+    if raw:
+        return Path(raw).expanduser()
+    return libraries_root() / _slug(str((library or {}).get("name") or "library"))
+
+
+def default_output_path(name: str, taken: Any = ()) -> str:
+    """A collision-free default folder for a library called *name*."""
+    base = _slug(name)
+    used = {str(t) for t in taken}
+    candidate = libraries_root() / base
+    n = 2
+    while str(candidate) in used:
+        candidate = libraries_root() / f"{base}-{n}"
+        n += 1
+    return str(candidate)
+
+
+def normalize_output_path(raw: Any, fallback: str) -> str:
+    """Validate a user-supplied output folder. Raises ValueError when unsafe.
+
+    This path is written verbatim into the agent's brief as a write target, so it
+    is a privilege boundary, not a preference. The agent runs in-process with the
+    gateway's privileges; a path pointing at ``~/.ssh`` or at the app's own
+    install directory would turn "change my output folder" into arbitrary
+    overwrite of credentials or of the app's Python.
+
+    Validation is deliberately absolute-only and reject-only -- no silent
+    rewriting. A path that is nearly right is a path the user should fix.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return fallback
+    if "\x00" in text or len(text) > 1024:
+        raise ValueError("output folder path is not valid")
+
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError("output folder must be an absolute path")
+    resolved = path.resolve()
+
+    if resolved == Path(resolved.anchor):
+        raise ValueError("output folder cannot be the filesystem root")
+    if any(part == ".git" for part in resolved.parts):
+        raise ValueError("output folder cannot be inside a .git directory")
+
+    for blocked in _blocked_output_roots():
+        if resolved == blocked or _is_within(resolved, blocked):
+            raise ValueError(f"output folder is not allowed: {blocked} is protected")
+
+    # The Kiro Crew data home holds agents, credentials, and app code. Only the
+    # app's own workspace subtree is a legitimate target inside it.
+    home = data_home().resolve()
+    if (resolved == home or _is_within(resolved, home)) and not _is_within(
+        resolved, workspace_dir().resolve()
+    ):
+        raise ValueError(
+            "output folder must be outside the Kiro Crew data home, or inside "
+            f"{workspace_dir()}"
+        )
+
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("output folder path already exists and is not a directory")
+
+    # Defence in depth: the host's own sensitive-path denylist knows about files
+    # this app has never heard of. Best-effort -- store.py must stay importable
+    # without the gateway installed, which is how its tests run.
+    try:
+        from kiro_crew.security import is_sensitive_path  # type: ignore
+
+        if is_sensitive_path(str(resolved)):
+            raise ValueError("output folder is a protected location")
+    except ImportError:
+        pass
+
+    return str(resolved)
+
+
+def ensure_output_dir(library: dict[str, Any]) -> Path:
+    """Create a library's output folder if it is missing. Returns it."""
+    path = library_output_dir(library)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _blocked_output_roots() -> tuple[Path, ...]:
+    """System and credential locations that are never valid output folders."""
+    home = Path.home()
+    names = (
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".kube",
+        ".docker",
+        ".config",
+        ".local/share/keyrings",
+        "Library/Keychains",
+    )
+    roots = [home / n for n in names]
+    # Targeted rather than all of /var: on macOS the system temp dir resolves to
+    # /private/var/folders, and refusing a scratch directory buys no safety while
+    # breaking a legitimate destination.
+    roots += [
+        Path(p)
+        for p in (
+            "/etc",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/System",
+            "/private/etc",
+            "/var/db",
+            "/var/log",
+            "/var/root",
+        )
+    ]
+    out = []
+    for r in roots:
+        try:
+            out.append(r.resolve())
+        except OSError:
+            continue
+    return tuple(out)
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _slug(text: str) -> str:
+    """Folder-safe slug. Always non-empty, never a path traversal."""
+    out = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")[:48]
+    return out or "library"
+
+
 def normalize_library_params(raw: dict[str, Any]) -> dict[str, Any]:
     """Validate the five parameters a library owns. Raises ValueError on garbage."""
     canvas = _int(raw.get("canvas"), 16, 8, 512)
@@ -141,7 +311,15 @@ def normalize_job_fields(raw: dict[str, Any]) -> dict[str, Any]:
     names = [str(n).strip() for n in names_raw if str(n).strip()]
     if not names:
         raise ValueError("at least one icon name is required")
-    if len(names) > MAX_NAMES:
+
+    kind = str(raw.get("kind") or "new")
+    if kind not in VALID_JOB_KINDS:
+        raise ValueError(f"kind must be one of {VALID_JOB_KINDS}")
+
+    # A redraw covers whatever the library already holds, so MAX_NAMES -- a limit
+    # on how much divergent thinking to ask for in one go -- does not apply. The
+    # ledger cap still bounds it in practice.
+    if kind == "new" and len(names) > MAX_NAMES:
         raise ValueError(f"at most {MAX_NAMES} icons per request")
 
     mode = str(raw.get("mode") or "concepts")
@@ -150,7 +328,8 @@ def normalize_job_fields(raw: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "names": names,
-        "mode": mode,
+        "mode": "ship" if kind == "redraw" else mode,
+        "kind": kind,
         "notes": str(raw.get("notes") or "").strip()[:2000],
     }
 
@@ -175,40 +354,76 @@ def merge_job_params(library: dict[str, Any], fields: dict[str, Any]) -> dict[st
     return {**fields, **_library_params_from(library.get("params", {}))}
 
 
-def new_library(name: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Create a library and seed its own metaphor ledger."""
+def new_library(name: str, params: dict[str, Any], output_path: Any = None) -> dict[str, Any]:
+    """Create a library, seed its metaphor ledger, and create its output folder."""
     state = load_state()
-    if len(state.get("libraries", [])) >= MAX_LIBRARIES:
+    libs = state.get("libraries", [])
+    if len(libs) >= MAX_LIBRARIES:
         raise ValueError(f"at most {MAX_LIBRARIES} libraries")
     clean = str(name or "").strip()[:80]
     if not clean:
         raise ValueError("library name is required")
-    lib = _library_record(clean, params)
-    state["libraries"] = [*state.get("libraries", []), lib]
+    taken = [str(lib.get("outputPath") or "") for lib in libs]
+    resolved = normalize_output_path(output_path, default_output_path(clean, taken))
+    lib = _library_record(clean, params, resolved)
+    state["libraries"] = [*libs, lib]
     save_state(state)
     _seed_library_ledger(lib["id"], lib["name"])
+    ensure_output_dir(lib)
     return lib
 
 
 def update_library(lib_id: str, **fields: Any) -> dict[str, Any] | None:
-    """Rename a library and/or change its parameters.
+    """Rename a library, change its parameters, and/or repoint its output folder.
 
     Changing parameters does NOT retro-edit finished jobs: their stored params
     record what was actually drawn. New requests pick up the new set.
+
+    Changing the output folder copies existing SVGs across rather than moving
+    them. Copying is the conservative choice: the gallery reads from the current
+    folder, so a move that half-failed would make icons vanish, and nothing here
+    is worth deleting a user's only copy of a file for.
     """
     state = load_state()
     for lib in state.get("libraries", []):
-        if lib.get("id") == lib_id:
-            if "name" in fields:
-                clean = str(fields["name"] or "").strip()[:80]
-                if not clean:
-                    raise ValueError("library name is required")
-                lib["name"] = clean
-            if "params" in fields:
-                lib["params"] = normalize_library_params(fields["params"] or {})
-            save_state(state)
-            return lib
+        if lib.get("id") != lib_id:
+            continue
+        if "name" in fields:
+            clean = str(fields["name"] or "").strip()[:80]
+            if not clean:
+                raise ValueError("library name is required")
+            lib["name"] = clean
+        if "params" in fields:
+            lib["params"] = normalize_library_params(fields["params"] or {})
+        if "outputPath" in fields:
+            previous = library_output_dir(lib)
+            resolved = normalize_output_path(
+                fields["outputPath"], default_output_path(lib.get("name") or "library")
+            )
+            lib["outputPath"] = resolved
+            target = ensure_output_dir(lib)
+            if target != previous:
+                _copy_svgs(previous, target)
+        save_state(state)
+        return lib
     return None
+
+
+def _copy_svgs(source: Path, target: Path) -> int:
+    """Copy ``*.svg`` from *source* into *target*, never overwriting. Best-effort."""
+    if not source.is_dir():
+        return 0
+    copied = 0
+    for path in sorted(source.glob("*.svg")):
+        dest = target / path.name
+        if dest.exists():
+            continue
+        try:
+            shutil.copy2(path, dest)
+            copied += 1
+        except OSError:
+            continue
+    return copied
 
 
 def get_library(lib_id: str) -> dict[str, Any] | None:
@@ -219,12 +434,16 @@ def get_library(lib_id: str) -> dict[str, Any] | None:
 
 
 def public_library(state: dict[str, Any], lib: dict[str, Any]) -> dict[str, Any]:
-    """Library plus the counts the left panel header needs."""
+    """Library plus the counts and resolved paths the UI needs."""
     lid = lib.get("id")
     jobs = [j for j in state.get("jobs", []) if j.get("libraryId") == lid]
     out = dict(lib)
     out["jobCount"] = len(jobs)
     out["iconCount"] = sum(len(j.get("icons") or []) for j in jobs)
+    # Resolved rather than stored: pre-output-path libraries have no stored value,
+    # and the UI should show where files actually land, not an empty string.
+    out["outputPath"] = str(library_output_dir(lib))
+    out["defaultOutputPath"] = str(libraries_root() / _slug(str(lib.get("name") or "library")))
     return out
 
 
@@ -242,7 +461,8 @@ def new_job(library: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
         "proof": "",
         "note": "",
     }
-    job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    # The library's output folder, not a per-job one: the icons are the library's.
+    ensure_output_dir(library)
     state["jobs"] = [job, *state.get("jobs", [])]
     save_state(state)
     return job
@@ -275,22 +495,52 @@ def compose_brief(job: dict[str, Any], library: dict[str, Any] | None = None) ->
     jid = job["id"]
     lib_id = job.get("libraryId") or ""
     lib_name = (library or {}).get("name") or lib_id or "(none)"
+    out_dir = library_output_dir(library or {})
     ledger = library_ledger_path(lib_id) if lib_id else ledger_path()
     names = "\n".join(f"  - {n}" for n in p["names"])
-    directive = (
-        "SHIP — do not wait for approval. Choose the strongest metaphor yourself, "
-        "state in one line which you chose and what you rejected, then draw."
-        if p["mode"] == "ship"
-        else "CONCEPTS — stop after step 2. Present three metaphors per icon and wait "
-        "for the user to pick. Do not draw yet."
-    )
+    is_redraw = p.get("kind") == "redraw"
+    if is_redraw:
+        directive = (
+            "REDRAW — the parameters below changed and this library's existing "
+            "icons must be re-rendered to match them.\n\n"
+            "Do NOT diverge on metaphors and do NOT invent new ones. Every icon "
+            "listed already has a metaphor recorded in the ledger; read it and "
+            "redraw that same metaphor at the new parameters. Changing a "
+            "silhouette here is a defect: the user asked for a different stroke "
+            "or canvas, not a different idea.\n\n"
+            "If a listed icon has no ledger entry, say so and skip it rather "
+            "than guessing what it used to be. Overwrite the existing SVG files."
+        )
+    elif p["mode"] == "ship":
+        directive = (
+            "SHIP — do not wait for approval. Choose the strongest metaphor yourself, "
+            "state in one line which you chose and what you rejected, then draw."
+        )
+    else:
+        directive = (
+            "CONCEPTS — stop after step 2. Present three metaphors per icon and wait "
+            "for the user to pick. Do not draw yet."
+        )
     notes = f"\n\nDesigner's notes:\n{p['notes']}" if p["notes"] else ""
 
-    return f"""Icon Studio job {jid}, in library "{lib_name}".
+    heading = "redraw" if is_redraw else "job"
+    listing = "Icons to redraw" if is_redraw else "Icons requested"
+    ledger_note = (
+        """The ledger above is scoped to THIS library and records the metaphor behind
+every icon in it. It is your source of truth for this redraw: look each icon up
+and reproduce its metaphor. Update a row only if the new parameters forced a
+genuine construction change, and say which rows you touched."""
+        if is_redraw
+        else """The ledger above is scoped to THIS library and lists every metaphor already
+spent in it. Read it before you diverge and append to it before you finish: an
+icon that repeats a silhouette already in the library is a defect, even if the
+icon is good on its own."""
+    )
+    return f"""Icon Studio {heading} {jid}, in library "{lib_name}".
 
 {directive}
 
-Icons requested ({len(p['names'])}):
+{listing} ({len(p['names'])}):
 {names}
 
 Parameters (owned by the library — do not deviate, these are what make the
@@ -302,20 +552,22 @@ library's icons a set rather than a pile):
   - keyline: {p['keyline']}
 
 Paths (use these exactly):
-  - SVG output dir: {job_dir(jid)}
+  - SVG output dir: {out_dir}
   - metaphor ledger: {ledger}
   - state file:      {state_path()}
   - contact sheet:   python3 {app_scripts_dir() / 'contact_sheet.py'} --job {jid}
 
-The ledger above is scoped to THIS library and lists every metaphor already
-spent in it. Read it before you diverge and append to it before you finish: an
-icon that repeats a silhouette already in the library is a defect, even if the
-icon is good on its own.
+Write one file per icon, named after the icon, directly in the output dir above:
+{out_dir}/<icon-name>.svg — no per-request subfolder. That folder is the whole
+library's icon set, which is why a redraw overwrites a file in place instead of
+creating a second copy of the same icon under a new request.
+
+{ledger_note}
 
 Keep job {jid} in the state file current as you go: set `status` to concepts,
 drawing, proofing, then done (or failed with a `note`), and fill `icons` with
-one entry per shipped file: {{"name", "file", "metaphor"}} where `file` is
-relative to the workspace directory.{notes}
+one entry per shipped file: {{"name", "file", "metaphor"}} where `file` is the
+bare file name inside the output dir.{notes}
 """
 
 
@@ -326,6 +578,25 @@ def library_ledger_path(lib_id: str) -> Path:
     return workspace_dir() / "ledgers" / f"{_safe_id(lib_id)}.md"
 
 
+def library_icon_names(lib_id: str) -> list[str]:
+    """Distinct icon names shipped in a library, newest occurrence first.
+
+    This is the roster a redraw covers. Deliberately drawn from ``icons``
+    (what was actually shipped) rather than from requested ``params['names']``:
+    a name that was asked for but never drawn has no ledger entry, so a redraw
+    has nothing to preserve for it.
+    """
+    seen: dict[str, None] = {}
+    for job in load_state().get("jobs", []):
+        if job.get("libraryId") != lib_id:
+            continue
+        for icon in job.get("icons") or []:
+            name = str(icon.get("name") or "").strip()
+            if name and name not in seen:
+                seen[name] = None
+    return list(seen)
+
+
 def library_icons(lib_id: str) -> list[dict[str, Any]]:
     """Every icon shipped in a library, newest job first, with sanitized markup.
 
@@ -334,31 +605,73 @@ def library_icons(lib_id: str) -> list[dict[str, Any]]:
     :func:`sanitize_svg` for why that is not optional.
     """
     state = load_state()
-    root = workspace_dir()
+    library = next((l for l in state.get("libraries", []) if l.get("id") == lib_id), None)
+    out_dir = library_output_dir(library or {})
     out: list[dict[str, Any]] = []
     for job in state.get("jobs", []):
         if job.get("libraryId") != lib_id:
             continue
         for icon in job.get("icons") or []:
             rel = str(icon.get("file") or "")
-            svg = ""
-            if rel:
-                try:
-                    path = (root / rel).resolve()
-                    path.relative_to(root.resolve())
-                    svg = sanitize_svg(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    svg = ""
             out.append(
                 {
                     "name": str(icon.get("name") or ""),
                     "metaphor": str(icon.get("metaphor") or ""),
                     "file": rel,
                     "jobId": job.get("id", ""),
-                    "svg": svg,
+                    "svg": _read_icon_svg(rel, out_dir),
                 }
             )
     return out
+
+
+def _read_icon_svg(rel: str, out_dir: Path) -> str:
+    """Read and sanitize one icon, from the library folder or the legacy location.
+
+    Two roots because two eras: the agent now writes flat into the library's
+    output folder and records a bare filename, but jobs from before output paths
+    existed recorded a path relative to the workspace. Each root is containment-
+    checked separately -- a filename is only ever resolved inside a root we chose,
+    never wherever a state-file string points.
+    """
+    if not rel:
+        return ""
+    for root, candidate in (
+        (out_dir, out_dir / Path(rel).name),
+        (workspace_dir(), workspace_dir() / rel),
+    ):
+        try:
+            path = candidate.resolve()
+            path.relative_to(root.resolve())
+            if not path.is_file():
+                continue
+            return sanitize_svg(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
+def render_job_sheet(job_id: str, sizes: list[int] | None = None):
+    """Render a job's contact sheet from its library's output folder.
+
+    Job-scoped, not library-scoped: the sheet proves the icons THIS request
+    produced. Since the folder is flat and shared by every request in the
+    library, the job's own icon names are the filter.
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError(f"no such job: {job_id}")
+    library = get_library(str(job.get("libraryId") or "")) or {}
+    names = [str(i.get("name") or "") for i in (job.get("icons") or [])]
+    names = [n for n in names if n]
+    return render_dir(
+        library_output_dir(library),
+        proof_path(job_id, 1),
+        proof_path(job_id, 2),
+        sizes=sizes or (job.get("params", {}).get("sizes") or None),
+        title=f"Icon Studio — {job_id}",
+        names=names or None,
+    )
 
 
 _SVG_BAD_TAGS = ("script", "foreignobject", "iframe", "style", "image", "use", "animate")
@@ -416,12 +729,13 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
 # --- internals -----------------------------------------------------------------
 
 
-def _library_record(name: str, params: dict[str, Any]) -> dict[str, Any]:
+def _library_record(name: str, params: dict[str, Any], output_path: str = "") -> dict[str, Any]:
     return {
         "id": _new_library_id(),
         "name": name,
         "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "params": normalize_library_params(params or {}),
+        "outputPath": output_path or default_output_path(name),
     }
 
 
