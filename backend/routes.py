@@ -16,8 +16,58 @@ from aiohttp import web
 
 from kiro_crew.apps.route_registry import AppRoute
 
-from . import store
-from .contact_sheet import RenderError, find_browser, proof_path, render_job, workspace_dir
+
+def _bootstrap_package() -> None:
+    """Make relative imports work inside an EXTERNAL app's backend package.
+
+    The host loads this file with ``importlib.util.spec_from_file_location``
+    under the synthetic name ``_kirocrew_app_icon-studio.backend.routes`` and
+    does NOT create the parent packages that name implies. Relative imports
+    resolve through ``sys.modules[__package__]``, so ``from . import store``
+    dies with::
+
+        ModuleNotFoundError: No module named '_kirocrew_app_icon-studio'
+
+    which the RouteRegistry catches, logs, and turns into ZERO registered
+    routes -- after which every request to /api/apps/icon-studio 404s with the
+    generic ``{"error": "not found"}``. The app looks installed and enabled and
+    is completely dead.
+
+    Builtin apps get away with relative imports because they genuinely live
+    inside the ``kiro_crew`` package. External apps do not, so register the
+    missing parents ourselves with ``__path__`` pointing at this directory.
+
+    Reusing the host's own naming is deliberate: it sweeps ``sys.modules`` by
+    the ``_kirocrew_app_<name>.`` prefix on disable, so these synthetic entries
+    are unloaded with the rest and a re-enable picks up fresh code.
+    """
+    import sys
+    import types
+    from pathlib import Path
+
+    parts = __name__.split(".")
+    if len(parts) < 2:
+        # Imported normally (tests, scripts) -- real packages already exist.
+        return
+    here = str(Path(__file__).resolve().parent)
+    for depth in range(1, len(parts)):
+        name = ".".join(parts[:depth])
+        if name in sys.modules:
+            continue
+        pkg = types.ModuleType(name)
+        pkg.__path__ = [here]  # type: ignore[attr-defined]
+        sys.modules[name] = pkg
+
+
+_bootstrap_package()
+
+from . import store  # noqa: E402
+from .contact_sheet import (  # noqa: E402
+    RenderError,
+    find_browser,
+    proof_path,
+    workspace_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +82,7 @@ def register_routes(ctx: Any) -> list[AppRoute]:
         AppRoute("POST", "/libraries", create_library),
         AppRoute("PATCH", "/libraries/{lib_id}", patch_library),
         AppRoute("GET", "/libraries/{lib_id}/icons", get_library_icons),
+        AppRoute("POST", "/libraries/{lib_id}/redraw", redraw_library),
         AppRoute("POST", "/jobs", create_job),
         AppRoute("POST", "/jobs/{job_id}/render", render_sheet),
         AppRoute("GET", "/jobs/{job_id}/proof", get_proof),
@@ -82,22 +133,74 @@ async def get_state(request: web.Request, ctx: Any) -> web.Response:
 
 
 async def create_library(request: web.Request, ctx: Any) -> web.Response:
+    """Create a library from a name alone.
+
+    Parameters are NOT asked for here. They default to the house set and are
+    revisable later via PATCH, because a library's spec is a decision the user
+    refines once there are icons to look at -- not a gate before any exist.
+    """
     denied = _unauthorized(request)
     if denied:
         return denied
     try:
         body = await _json_body(request)
-        params = store.normalize_library_params(body.get("params") or body)
-        lib = await asyncio.to_thread(store.new_library, body.get("name"), params)
+        params = store.normalize_library_params(body.get("params") or {})
+        lib = await asyncio.to_thread(
+            store.new_library, body.get("name"), params, body.get("outputPath")
+        )
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    logger.info("Icon Studio: created library %s (%s)", lib["id"], lib["name"])
+    except OSError as exc:
+        return web.json_response({"error": f"could not create that folder: {exc}"}, status=400)
+    logger.info(
+        "Icon Studio: created library %s (%s) -> %s",
+        lib["id"],
+        lib["name"],
+        lib.get("outputPath"),
+    )
     state = await asyncio.to_thread(store.load_state)
     return web.json_response({"library": store.public_library(state, lib)})
 
 
+async def redraw_library(request: web.Request, ctx: Any) -> web.Response:
+    """Re-render every icon in a library at its current parameters.
+
+    Returns the same ``{job, brief}`` shape as ``create_job`` so the UI
+    dispatches it through one code path. The brief tells the agent to reuse each
+    icon's recorded metaphor rather than diverge -- changing parameters must not
+    change what the icons mean.
+    """
+    denied = _unauthorized(request)
+    if denied:
+        return denied
+    lib_id = request.match_info.get("lib_id", "")
+    library = await asyncio.to_thread(store.get_library, lib_id)
+    if library is None:
+        return web.json_response({"error": "no such library"}, status=404)
+
+    names = await asyncio.to_thread(store.library_icon_names, lib_id)
+    if not names:
+        return web.json_response(
+            {"error": "this library has no shipped icons to redraw yet"}, status=400
+        )
+
+    try:
+        body = await _json_body(request)
+    except ValueError:
+        body = {}
+    fields = store.normalize_job_fields(
+        {"names": names, "kind": "redraw", "notes": body.get("notes")}
+    )
+    job = await asyncio.to_thread(store.new_job, library, fields)
+    brief = store.compose_brief(job, library)
+    logger.info(
+        "Icon Studio: redraw job %s in library %s (%d icons)", job["id"], lib_id, len(names)
+    )
+    return web.json_response({"job": store.public_job(job), "brief": brief})
+
+
 async def patch_library(request: web.Request, ctx: Any) -> web.Response:
-    """Rename a library or change its parameter set.
+    """Rename a library, change its parameter set, or repoint its output folder.
 
     Existing jobs keep the parameters they were drawn with -- their stored params
     are a record of what happened, not a live reference.
@@ -113,11 +216,15 @@ async def patch_library(request: web.Request, ctx: Any) -> web.Response:
             fields["name"] = body["name"]
         if "params" in body:
             fields["params"] = body["params"]
+        if "outputPath" in body:
+            fields["outputPath"] = body["outputPath"]
         if not fields:
             return web.json_response({"error": "nothing to update"}, status=400)
         lib = await asyncio.to_thread(store.update_library, lib_id, **fields)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
+    except OSError as exc:
+        return web.json_response({"error": f"could not use that folder: {exc}"}, status=400)
     if lib is None:
         return web.json_response({"error": "no such library"}, status=404)
     state = await asyncio.to_thread(store.load_state)
@@ -186,10 +293,12 @@ async def render_sheet(request: web.Request, ctx: Any) -> web.Response:
 
     sizes = job.get("params", {}).get("sizes") or None
     try:
-        sheet = await asyncio.to_thread(render_job, job_id, sizes)
+        sheet = await asyncio.to_thread(store.render_job_sheet, job_id, sizes)
     except RenderError as exc:
         await asyncio.to_thread(store.update_job, job_id, note=str(exc))
         return web.json_response({"error": str(exc)}, status=409)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=404)
 
     rel = str(sheet.png_1x).replace(str(workspace_dir()) + "/", "")
     await asyncio.to_thread(store.update_job, job_id, proof=rel, note="")

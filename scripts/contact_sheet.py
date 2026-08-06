@@ -23,7 +23,6 @@ if str(APP_ROOT) not in sys.path:
 from backend.contact_sheet import (  # noqa: E402
     RenderError,
     render_dir,
-    render_job,
 )
 
 
@@ -48,15 +47,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.job:
-            if sizes is None:
-                from backend.store import get_job
+            # store, not contact_sheet: only the store knows which library the job
+            # belongs to, and therefore which folder its SVGs are in.
+            from backend.store import render_job_sheet
 
-                job = get_job(args.job)
-                if job is None:
-                    print(f"no such job: {args.job}", file=sys.stderr)
-                    return 1
-                sizes = job.get("params", {}).get("sizes") or None
-            sheet = render_job(args.job, sizes)
+            sheet = render_job_sheet(args.job, sizes)
         elif args.dir:
             directory = Path(args.dir).expanduser().resolve()
             out = Path(args.out).expanduser() if args.out else directory / "contact-sheet.png"
@@ -66,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("one of --job or --dir is required")
             return 2
     except RenderError as exc:
+        print(f"contact sheet FAILED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
         print(f"contact sheet FAILED: {exc}", file=sys.stderr)
         return 1
 

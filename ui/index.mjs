@@ -859,37 +859,49 @@ function CreateView({ library, onSubmit, onEditParams, busy, error }) {
   ])
 }
 
-function NewLibraryView({ onCreate, busy, error }) {
+/** Library creation asks for a NAME only.
+ *
+ *  Parameters deliberately are not here. They default to the house set and are
+ *  revisable later from the parameter editor, which can also redraw the whole
+ *  set -- so committing to a canvas and stroke before a single icon exists
+ *  would be asking the user to decide the thing they have least information
+ *  about, at the moment they have least information. */
+function NewLibraryView({ onCreate, busy, error, defaults }) {
   const [name, setName] = useState('')
-  const [params, setParams] = useState({
-    canvas: '16',
-    stroke: '1',
-    style: 'outline',
-    keyline: 'square',
-  })
+  const submit = () => onCreate({ name })
   return el('div', {}, [
     el(
       'div',
-      { style: { marginBottom: '16px', maxWidth: '360px' } },
+      { style: { maxWidth: '360px' } },
       [
         el('label', { style: labelStyle }, 'Library name', 'l'),
         el('input', {
           className: 'is-field',
           value: name,
           onChange: (e) => setName(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === 'Enter' && name.trim() && !busy) submit()
+          },
           placeholder: 'Product icons',
+          autoFocus: true,
           style: fieldStyle,
         }, undefined, 'i'),
       ],
       'name',
     ),
-    el('div', { style: sectionLabel }, 'Parameters for every icon in this library', 's'),
-    el(ParamGrid, { values: params, onChange: setParams }, undefined, 'g'),
     el(
       'div',
-      { style: { fontSize: '11px', color: MUTED, marginTop: '10px', lineHeight: 1.5 } },
-      'These are fixed for the library and inherited by every request, so icons drawn weeks apart still belong together. The library also gets its own metaphor ledger, so no two icons in it resolve to the same silhouette.',
+      { style: { fontSize: '11px', color: MUTED, marginTop: '10px', lineHeight: 1.55 } },
+      defaults
+        ? `Starts on the house spec — ${defaults}. Every request in the library inherits it, so the icons stay a set. You can change it later and redraw everything at the new spec.`
+        : 'Every request in the library inherits one shared spec, so the icons stay a set.',
       'h',
+    ),
+    el(
+      'div',
+      { style: { fontSize: '11px', color: MUTED, marginTop: '6px', lineHeight: 1.55 } },
+      'The icons are saved to a folder of their own under the Kiro Crew workspace. You can point that at any local folder afterwards.',
+      'h2',
     ),
     error
       ? el(
@@ -915,7 +927,7 @@ function NewLibraryView({ onCreate, busy, error }) {
         label: 'Create library',
         disabled: busy || !name.trim(),
         busy,
-        onClick: () => onCreate({ name, params }),
+        onClick: submit,
       }),
       'a',
     ),
@@ -1093,7 +1105,16 @@ function RequestView({ job, icons, canProve, onRender, rendering, proofStamp }) 
         el(Chip, {}, `${p.stroke}px stroke`, 's'),
         el(Chip, {}, p.style, 'y'),
         el(Chip, {}, `${p.keyline} keyline`, 'k'),
-        el(Chip, {}, p.mode === 'ship' ? 'Drew straight away' : 'Metaphors first', 'm'),
+        el(
+          Chip,
+          {},
+          p.kind === 'redraw'
+            ? 'Redraw at new spec'
+            : p.mode === 'ship'
+              ? 'Drew straight away'
+              : 'Metaphors first',
+          'm',
+        ),
       ],
       'chips',
     ),
@@ -1315,32 +1336,37 @@ export default function IconStudio() {
     savePref(LS.panelOpen, next)
   }
 
+  /** Hand a created job to the designer agent in a background slot, so the user
+   *  stays on this page. Shared by new requests and whole-set redraws. */
+  const dispatch = async (data) => {
+    const resp = await fetch('/api/chat?ws=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: data.brief,
+        slot: `icon-studio-${data.job.id}`,
+        agent: 'icon-designer',
+      }),
+    })
+    // A silent dispatch failure would leave a queued request with no agent
+    // behind it, which looks identical to "the agent is thinking".
+    if (!resp.ok) {
+      setError(
+        `Request ${data.job.id} was created but the designer agent could not be started (${resp.status}). Nothing is drawing.`,
+      )
+    }
+    await load()
+    setSelected(data.job.id)
+    setView('request')
+  }
+
   const submitJob = async ({ names, mode, notes }) => {
     if (!library) return
     setBusy(true)
     setError('')
     try {
       const data = await api('/jobs', jsonPost({ libraryId: library.id, names, mode, notes }))
-      // Dispatch the agent into a background slot: the user stays on this page.
-      const resp = await fetch('/api/chat?ws=1', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: data.brief,
-          slot: `icon-studio-${data.job.id}`,
-          agent: 'icon-designer',
-        }),
-      })
-      // A silent dispatch failure would leave a queued request with no agent
-      // behind it, which looks identical to "the agent is thinking".
-      if (!resp.ok) {
-        setError(
-          `Request ${data.job.id} was created but the designer agent could not be started (${resp.status}). Nothing is drawing.`,
-        )
-      }
-      await load()
-      setSelected(data.job.id)
-      setView('request')
+      await dispatch(data)
     } catch (err) {
       setError(String(err.message || err))
     } finally {
@@ -1348,11 +1374,13 @@ export default function IconStudio() {
     }
   }
 
-  const createLibrary = async ({ name, params }) => {
+  const createLibrary = async ({ name }) => {
     setBusy(true)
     setError('')
     try {
-      const data = await api('/libraries', jsonPost({ name, params }))
+      // Name only — parameters default to the house spec and are revisable
+      // later, with a redraw available once there are icons to bring forward.
+      const data = await api('/libraries', jsonPost({ name }))
       await load()
       setActiveLib(data.library.id)
       savePref(LS.library, data.library.id)
@@ -1364,18 +1392,32 @@ export default function IconStudio() {
     }
   }
 
-  const saveParams = async (params) => {
+  const saveParams = async (params, redraw, outputPath) => {
     if (!library) return
     setBusy(true)
     setError('')
     try {
+      const patch = { params }
+      // Only send the path when it actually changed: a PATCH that repoints the
+      // folder copies files, so resending the same value on every parameter save
+      // would do filesystem work for nothing.
+      if (typeof outputPath === 'string' && outputPath !== (library.outputPath || '')) {
+        patch.outputPath = outputPath
+      }
       await api(`/libraries/${library.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ params }),
+        body: JSON.stringify(patch),
       })
-      await load()
-      setView('create')
+      if (redraw) {
+        // Save first, then redraw: the redraw job inherits the library's params,
+        // so the PATCH has to have landed or it would redraw at the old spec.
+        const data = await api(`/libraries/${library.id}/redraw`, { method: 'POST' })
+        await dispatch(data)
+      } else {
+        await load()
+        setView('create')
+      }
     } catch (err) {
       setError(String(err.message || err))
     } finally {
@@ -1444,14 +1486,24 @@ export default function IconStudio() {
           },
         },
         [
-          el('div', { style: { fontSize: '18px', fontWeight: 600 } }, 'Create your first icon library', 'h'),
+          el('div', { style: { fontSize: '18px', fontWeight: 600 } }, 'Name your first icon library', 'h'),
           el(
             'div',
             { style: { fontSize: '12px', color: MUTED, marginTop: '8px', lineHeight: 1.55 } },
-            'A library fixes the canvas, stroke, style, and keyline once, then every request you make inside it inherits them — so icons you design weeks apart still look like one set.',
+            'A library is a set of icons that share one spec, so icons you design weeks apart still look like they belong together. It starts on the house spec — you can change it later and redraw the whole set at the new one.',
             'b',
           ),
-          el('div', { style: { marginTop: '18px' } }, el(NewLibraryView, { onCreate: createLibrary, busy, error }), 'f'),
+          el(
+            'div',
+            { style: { marginTop: '18px' } },
+            el(NewLibraryView, {
+              onCreate: createLibrary,
+              busy,
+              error,
+              defaults: '16px canvas, 1px stroke, outline, square keyline',
+            }),
+            'f',
+          ),
         ],
       ),
     )
@@ -1480,7 +1532,11 @@ export default function IconStudio() {
 
   const breadcrumb = {
     request: job ? `${library?.name || ''} · ${job.id}` : '',
-    gallery: library ? `${library.name} · ${plural(galleryIcons.length, 'icon')}` : '',
+    // The folder is the point of the gallery: these files exist on disk and the
+    // user's next move is usually to go get them.
+    gallery: library
+      ? `${library.name} · ${plural(galleryIcons.length, 'icon')} · ${library.outputPath || ''}`
+      : '',
     create: library ? library.name : '',
     'edit-params': library ? library.name : '',
   }[view]
@@ -1532,6 +1588,11 @@ export default function IconStudio() {
               className: 'is-trigger',
               onClick: () => setLibSelOpen((v) => !v),
               'aria-expanded': libSelOpen,
+              // Notes carries both of these on its vault trigger; omitting them
+              // left the control announcing itself as a plain button with no
+              // hint that it opens a list.
+              'aria-haspopup': 'listbox',
+              'aria-label': 'Switch icon library',
               style: {
                 display: 'flex',
                 alignItems: 'center',
@@ -1732,12 +1793,24 @@ export default function IconStudio() {
           onEditParams: () => setView('edit-params'),
         })
       : null,
-    'new-library': el(NewLibraryView, { onCreate: createLibrary, busy, error }),
+    'new-library': el(NewLibraryView, {
+      onCreate: createLibrary,
+      busy,
+      error,
+      defaults: '16px canvas, 1px stroke, outline, square keyline',
+    }),
     'edit-params': library
       ? el('div', {}, [
           el(
             ParamEditor,
-            { library, busy, error, onSave: saveParams, onCancel: () => setView('create') },
+            {
+              library,
+              busy,
+              error,
+              iconCount: library.iconCount || 0,
+              onSave: saveParams,
+              onCancel: () => setView('create'),
+            },
             undefined,
             'e',
           ),
@@ -1954,27 +2027,70 @@ export default function IconStudio() {
 
 /** Parameter editor for an existing library. Separate component so its draft
  *  state resets whenever the pane is reopened. */
-function ParamEditor({ library, onSave, onCancel, busy, error }) {
+function ParamEditor({ library, onSave, onCancel, busy, error, iconCount }) {
   const [params, setParams] = useState(() => ({
     canvas: String(library.params.canvas),
     stroke: String(library.params.stroke),
     style: library.params.style,
     keyline: library.params.keyline,
   }))
+  const [outputPath, setOutputPath] = useState(library.outputPath || '')
+  const paramsChanged =
+    String(library.params.canvas) !== String(params.canvas) ||
+    String(library.params.stroke) !== String(params.stroke) ||
+    library.params.style !== params.style ||
+    library.params.keyline !== params.keyline
+  const pathChanged = (outputPath || '').trim() !== (library.outputPath || '')
+  const changed = paramsChanged || pathChanged
+  const save = (redraw) => onSave(params, redraw, outputPath.trim())
+
   return el('div', {}, [
+    el(ParamGrid, { values: params, onChange: setParams }, undefined, 'g'),
     el(
       'div',
-      { style: { fontSize: '12px', color: MUTED, marginBottom: '16px', lineHeight: 1.55 } },
-      'Requests already in this library keep the parameters they were drawn with — those are a record of what happened. Only new requests pick these up.',
-      'h',
+      { style: { fontSize: '11px', color: MUTED, marginTop: '14px', lineHeight: 1.55 } },
+      'Saving affects new requests only — the requests already in this library keep the parameters they were drawn with, because those are a record of what happened.',
+      'h1',
     ),
-    el(ParamGrid, { values: params, onChange: setParams }, undefined, 'g'),
+    iconCount > 0
+      ? el(
+          'div',
+          { style: { fontSize: '11px', color: MUTED, marginTop: '6px', lineHeight: 1.55 } },
+          `To bring the existing ${plural(iconCount, 'icon')} up to the new spec, save and redraw. The agent reuses each icon's recorded metaphor rather than inventing a new one, so only the drawing changes — not what the icons mean.`,
+          'h2',
+        )
+      : null,
+    // The output folder lives here rather than on the create screen for the same
+    // reason the parameters do: it is a decision worth revisiting once there are
+    // icons to put somewhere, not a gate before the library exists.
+    el(
+      'div',
+      { style: { marginTop: '22px' } },
+      [
+        el('div', { style: sectionLabel }, 'Output folder', 's'),
+        el('input', {
+          className: 'is-field',
+          value: outputPath,
+          onChange: (e) => setOutputPath(e.target.value),
+          spellCheck: false,
+          placeholder: library.defaultOutputPath || '',
+          style: { ...fieldStyle, fontSize: '12px' },
+        }, undefined, 'i'),
+        el(
+          'div',
+          { style: { fontSize: '11px', color: MUTED, marginTop: '8px', lineHeight: 1.55 } },
+          'Every icon in this library is written here as one SVG per name. Point it at any local folder — a design-system repo, say — and the icons land where you already work. Existing SVGs are copied across; the originals are left in place, never deleted.',
+          'h3',
+        ),
+      ],
+      'out',
+    ),
     error
       ? el(
           'div',
           {
             style: {
-              margin: '12px 0 0',
+              margin: '14px 0 0',
               padding: '8px 10px',
               borderRadius: '8px',
               fontSize: '11px',
@@ -1988,10 +2104,35 @@ function ParamEditor({ library, onSave, onCancel, busy, error }) {
       : null,
     el(
       'div',
-      { style: { marginTop: '18px', display: 'flex', gap: '8px', alignItems: 'center' } },
+      { style: { marginTop: '18px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
       [
-        el(Primary, { label: 'Save parameters', busy, disabled: busy, onClick: () => onSave(params) }, undefined, 'p'),
+        el(
+          Primary,
+          {
+            label: iconCount > 0 ? 'Save' : 'Save parameters',
+            busy,
+            disabled: busy,
+            onClick: () => save(false),
+          },
+          undefined,
+          'p',
+        ),
+        iconCount > 0
+          ? el(
+              Ghost,
+              {
+                label: `Save and redraw ${plural(iconCount, 'icon')}`,
+                icon: el(Refresh, { size: 12 }),
+                onClick: () => save(true),
+              },
+              undefined,
+              'r',
+            )
+          : null,
         el(Ghost, { label: 'Cancel', onClick: onCancel }, undefined, 'c'),
+        changed
+          ? el('span', { style: { fontSize: '11px', color: 'var(--warn)' } }, 'unsaved changes', 'w')
+          : null,
       ],
       'a',
     ),

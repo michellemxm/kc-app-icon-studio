@@ -212,18 +212,27 @@ def _clean_svg(text: str) -> str:
     return text.strip()
 
 
-def collect_icons(directory: Path) -> list[tuple[str, str]]:
-    """(name, inline svg markup) for every .svg in *directory*, sorted by name."""
+def collect_icons(directory: Path, names: list[str] | None = None) -> list[tuple[str, str]]:
+    """(name, inline svg markup) for .svg files in *directory*, sorted by name.
+
+    *names* restricts the sheet to those icon stems. A library's folder is flat
+    and shared by every request in it, so a per-request sheet has to filter or it
+    would proof the whole library and quietly claim icons it never drew.
+    """
     if not directory.is_dir():
         raise RenderError(f"no such icon directory: {directory}")
+    wanted = {str(n).strip() for n in names} if names else None
     icons: list[tuple[str, str]] = []
     for path in sorted(directory.glob("*.svg")):
+        if wanted is not None and path.stem not in wanted:
+            continue
         try:
             icons.append((path.stem, _clean_svg(path.read_text(encoding="utf-8"))))
         except OSError as exc:
             raise RenderError(f"could not read {path}: {exc}") from exc
     if not icons:
-        raise RenderError(f"no .svg files in {directory}")
+        scope = " matching this request" if wanted else ""
+        raise RenderError(f"no .svg files{scope} in {directory}")
     return icons
 
 
@@ -439,9 +448,13 @@ def render_dir(
     out_2x: Path,
     sizes: list[int] | None = None,
     title: str = "Contact sheet",
+    names: list[str] | None = None,
 ) -> Sheet:
-    """Render every SVG in *directory* into a light/dark contact sheet."""
-    icons = collect_icons(directory)
+    """Render the SVGs in *directory* into a light/dark contact sheet.
+
+    *names* narrows it to specific icon stems -- see :func:`collect_icons`.
+    """
+    icons = collect_icons(directory, names)
     sizes = sorted({int(s) for s in (sizes or [16, 24, 32]) if int(s) > 0})
     if not sizes:
         raise RenderError("no valid sizes requested")
@@ -474,7 +487,12 @@ def render_dir(
 
 
 def render_job(job_id: str, sizes: list[int] | None = None) -> Sheet:
-    """Render the contact sheet for an Icon Studio job."""
+    """Render a job's sheet from the LEGACY per-job icon directory.
+
+    Kept for pre-library job directories and ad-hoc use. Current jobs write into
+    their library's output folder, which only ``store`` can resolve -- use
+    ``store.render_job_sheet`` for those.
+    """
     return render_dir(
         job_dir(job_id),
         proof_path(job_id, 1),
