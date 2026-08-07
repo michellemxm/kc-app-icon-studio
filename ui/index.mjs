@@ -1228,7 +1228,8 @@ export default function IconStudio() {
   const [libraries, setLibraries] = useState(null)
   const [jobs, setJobs] = useState([])
   const [activeLib, setActiveLib] = useState(() => loadPref(LS.library, ''))
-  const [view, setView] = useState('empty')
+  // The gallery is the landing view: opening a library should show what is in it.
+  const [view, setView] = useState('gallery')
   const [selected, setSelected] = useState('')
   const [galleryIcons, setGalleryIcons] = useState([])
   const [jobIcons, setJobIcons] = useState([])
@@ -1308,10 +1309,10 @@ export default function IconStudio() {
   }, [galleryIcons, selected])
 
   // Reset the pane when the library changes — a request from another library
-  // must not stay open.
+  // must not stay open, and switching lands on the new library's icons.
   useEffect(() => {
     setSelected('')
-    setView('empty')
+    setView('gallery')
   }, [activeLib])
 
   const startResize = useCallback((e) => {
@@ -1384,7 +1385,10 @@ export default function IconStudio() {
       await load()
       setActiveLib(data.library.id)
       savePref(LS.library, data.library.id)
-      setView('create')
+      // Land on the library's own page. setActiveLib also fires the
+      // library-change effect, which sets this too -- stated explicitly here so
+      // the landing view does not depend on that effect's ordering.
+      setView('gallery')
     } catch (err) {
       setError(String(err.message || err))
     } finally {
@@ -1525,17 +1529,18 @@ export default function IconStudio() {
     create: 'Create new icons',
     'new-library': 'New icon library',
     'edit-params': 'Library parameters',
-    gallery: 'All icons',
+    // The gallery is the library's own page, so it carries the library's name
+    // rather than a generic "All icons" label.
+    gallery: library ? library.name : 'Icon Studio',
     request: requestTitle(job),
-    empty: library ? library.name : 'Icon Studio',
   }[view]
 
   const breadcrumb = {
     request: job ? `${library?.name || ''} · ${job.id}` : '',
-    // The folder is the point of the gallery: these files exist on disk and the
-    // user's next move is usually to go get them.
+    // No library name here — it is the title now. The folder stays: these files
+    // exist on disk and the user's next move is usually to go get them.
     gallery: library
-      ? `${library.name} · ${plural(galleryIcons.length, 'icon')} · ${library.outputPath || ''}`
+      ? `${plural(galleryIcons.length, 'icon')} · ${library.outputPath || ''}`
       : '',
     create: library ? library.name : '',
     'edit-params': library ? library.name : '',
@@ -1783,7 +1788,6 @@ export default function IconStudio() {
   // --- right pane -------------------------------------------------------------
 
   const body = {
-    empty: el(EmptyState, { onCreate: () => setView('create') }),
     create: library
       ? el(CreateView, {
           library,
@@ -1816,15 +1820,20 @@ export default function IconStudio() {
           ),
         ])
       : null,
-    gallery: el(
-      'div',
-      {},
-      el(IconGrid, {
-        icons: galleryIcons,
-        canvas: library?.params?.canvas,
-        empty: 'No icons have been shipped in this library yet.',
-      }),
-    ),
+    gallery: galleryIcons.length
+      ? el(
+          'div',
+          {},
+          el(IconGrid, {
+            icons: galleryIcons,
+            canvas: library?.params?.canvas,
+          }),
+        )
+      : // One empty state, not two. The gallery IS the library's landing page, so
+        // "this library has no icons" and "this gallery is empty" were the same
+        // sentence in two places -- the grid's one-liner said less and offered no
+        // way out of it.
+        el(EmptyState, { onCreate: () => setView('create') }),
     request: job
       ? el(RequestView, {
           job,
@@ -1837,7 +1846,10 @@ export default function IconStudio() {
       : el('div', { style: { fontSize: '12px', color: MUTED } }, 'That request no longer exists.'),
   }[view]
 
-  const showEmptyCentered = view === 'empty' && !libJobs.length
+  // Centre the empty state in the pane instead of seating it at the top of the
+  // reading column. Keyed off the icons, not the request list: a library can
+  // hold failed requests and still have nothing to show.
+  const showEmptyCentered = view === 'gallery' && !galleryIcons.length
 
   const pane = el(
     'div',
@@ -1920,7 +1932,10 @@ export default function IconStudio() {
                     fontSize: '23px',
                     fontWeight: 700,
                     lineHeight: 1.25,
-                    color: view === 'empty' ? MUTED : TEXT,
+                    // Always full-strength: this used to dim for the placeholder
+                    // "Icon Studio" title, but the gallery now shows a real
+                    // library name and a muted heading read as disabled.
+                    color: TEXT,
                     // Room for the action cluster so a long title cannot slide
                     // under the buttons.
                     paddingRight: '220px',
