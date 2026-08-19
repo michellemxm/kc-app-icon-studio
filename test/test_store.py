@@ -513,7 +513,60 @@ def test_contact_sheet_filters_to_one_job_within_a_shared_folder():
     assert [n for n, _ in just_one] == ["bell"]
 
 
+# --- opening the output folder --------------------------------------------------
+
+
+def test_reveal_binary_is_absolute_or_none():
+    """Never a bare name.
+
+    The front of the inherited PATH can be agent-writable, so resolving ``open``
+    or ``xdg-open`` through PATH would launch whatever was planted there -- on a
+    click the user has every reason to trust. An absolute path cannot be hijacked
+    that way, and None must be possible so a container without a file manager
+    reads as "not supported" rather than as a crash.
+    """
+    _fresh_store()
+    from backend import reveal
+
+    binary = reveal.reveal_binary()
+    assert binary is None or os.path.isabs(binary), f"not absolute: {binary!r}"
+    for candidate in reveal.REVEAL_BINARIES.values():
+        assert os.path.isabs(candidate), f"denylisted bare name: {candidate!r}"
+
+
+def test_reveal_env_pins_path_to_trusted_dirs_only():
+    """``xdg-open`` is a shell script that resolves its helper through PATH."""
+    _fresh_store()
+    from backend import reveal
+
+    original = os.environ.get("PATH", "")
+    os.environ["PATH"] = "/tmp/agent-writable:/usr/bin"
+    try:
+        env = reveal.trusted_env()
+        assert env["PATH"] == reveal.TRUSTED_PATH
+        assert "/tmp/agent-writable" not in env["PATH"]
+        # Only PATH is replaced -- the desktop-session vars have to survive or the
+        # file manager cannot reach the running session.
+        assert set(env) >= set(os.environ) - {"PATH"}
+    finally:
+        # Restore, or every later test in this process inherits a clobbered PATH.
+        os.environ["PATH"] = original
+
+
+def test_reveal_target_comes_from_the_library_not_a_caller():
+    """The revealed directory is the library's own recorded output folder."""
+    store, _ = _fresh_store()
+    target = Path(tempfile.mkdtemp(prefix="icon-studio-dest-")) / "revealed"
+    lib = store.new_library("L", {})
+    store.update_library(lib["id"], outputPath=str(target))
+
+    resolved = store.library_output_dir(store.get_library(lib["id"]))
+    assert resolved == target.resolve(), "reveal resolves through the library record"
+    assert resolved.is_dir()
+
+
 # --- host integration ----------------------------------------------------------
+
 
 
 def test_routes_module_loads_the_way_the_gateway_loads_it():
