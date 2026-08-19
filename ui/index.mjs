@@ -30,6 +30,9 @@ const ACCENT_FG = 'var(--accent-fg)'
 const TEXT = 'var(--text)'
 const MUTED = 'var(--muted)'
 const BORDER = 'var(--border)'
+// Notes' bottom-bar separator uses --border-strong; fall back to --border so an
+// older custom theme that never defined it still paints a line.
+const BORDER_STRONG = 'var(--border-strong, var(--border))'
 const CARD = 'var(--card)'
 const BG = 'var(--bg)'
 const ELEVATED = 'var(--bg-elevated, var(--card))'
@@ -171,6 +174,14 @@ const Refresh = (p) =>
     _jsx('path', { d: 'M21 12a9 9 0 1 1-3-6.7' }, 'a'),
     _jsx('path', { d: 'M21 4v5h-5' }, 'b'),
   ])
+const Folder = (p) =>
+  el(
+    Svg,
+    p,
+    _jsx('path', {
+      d: 'M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2z',
+    }),
+  )
 const Pen = (p) =>
   el(Svg, p, [
     _jsx('path', { d: 'M12 20h9' }, 'a'),
@@ -998,7 +1009,12 @@ function StepRail({ status }) {
   )
 }
 
-function IconTile({ icon, canvas }) {
+// HERO_PX is the largest size the tile renders. `single` collapses the tile to
+// that one size only -- the gallery ("All icons") shows one size per icon; the
+// request view keeps the multi-size row.
+const HERO_PX = 32
+
+function IconTile({ icon, canvas, single }) {
   return el(
     'div',
     {
@@ -1016,16 +1032,18 @@ function IconTile({ icon, canvas }) {
       },
     },
     [
-      el(IconArt, { svg: icon.svg, px: 32 }, undefined, 'hero'),
-      el(
-        'div',
-        { style: { display: 'flex', gap: '10px', alignItems: 'flex-end' } },
-        [
-          el(IconArt, { svg: icon.svg, px: 16 }, undefined, 'a'),
-          el(IconArt, { svg: icon.svg, px: canvas === 24 ? 24 : 24 }, undefined, 'b'),
-        ],
-        'sizes',
-      ),
+      el(IconArt, { svg: icon.svg, px: HERO_PX }, undefined, 'hero'),
+      single
+        ? null
+        : el(
+            'div',
+            { style: { display: 'flex', gap: '10px', alignItems: 'flex-end' } },
+            [
+              el(IconArt, { svg: icon.svg, px: 16 }, undefined, 'a'),
+              el(IconArt, { svg: icon.svg, px: canvas === 24 ? 24 : 24 }, undefined, 'b'),
+            ],
+            'sizes',
+          ),
       el(
         'div',
         {
@@ -1058,7 +1076,7 @@ function IconTile({ icon, canvas }) {
   )
 }
 
-function IconGrid({ icons, canvas, empty }) {
+function IconGrid({ icons, canvas, empty, single }) {
   if (!icons.length) {
     return el('div', { style: { fontSize: '12px', color: MUTED } }, empty)
   }
@@ -1071,7 +1089,9 @@ function IconGrid({ icons, canvas, empty }) {
         gap: '10px',
       },
     },
-    icons.map((ic, i) => el(IconTile, { icon: ic, canvas }, undefined, `${ic.jobId || ''}-${ic.name}-${i}`)),
+    icons.map((ic, i) =>
+      el(IconTile, { icon: ic, canvas, single }, undefined, `${ic.jobId || ''}-${ic.name}-${i}`),
+    ),
   )
 }
 
@@ -1236,6 +1256,7 @@ export default function IconStudio() {
   const [libSelOpen, setLibSelOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [rendering, setRendering] = useState(false)
+  const [revealing, setRevealing] = useState(false)
   const [error, setError] = useState('')
   const [proofStamp, setProofStamp] = useState(() => Date.now())
   const [panelOpen, setPanelOpen] = useState(() => loadPref(LS.panelOpen, true))
@@ -1426,6 +1447,23 @@ export default function IconStudio() {
       setError(String(err.message || err))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /** Open the library's output folder in Finder. Sends no path -- the backend
+   *  derives it from the library id, so the button cannot be pointed elsewhere. */
+  const revealFolder = async () => {
+    if (!library || revealing) return
+    setRevealing(true)
+    setError('')
+    try {
+      await api(`/libraries/${library.id}/reveal`, { method: 'POST' })
+    } catch (err) {
+      // Worth surfacing rather than swallowing: the usual cause is a folder the
+      // user moved or deleted, and the fix is to repoint it in Library parameters.
+      setError(String(err.message || err))
+    } finally {
+      setRevealing(false)
     }
   }
 
@@ -1681,64 +1719,6 @@ export default function IconStudio() {
         ],
         'head',
       ),
-      // The search row's slot. Notes puts an input + a 30x30 sort button here;
-      // per your 1.3 that becomes one button opening the whole-library gallery.
-      // The container keeps Notes' flex/gap so a second control can be added
-      // later without the row moving.
-      el(
-        'div',
-        {
-          style: {
-            display: 'flex',
-            gap: '6px',
-            alignItems: 'center',
-            padding: '0 12px 8px',
-            flexShrink: 0,
-          },
-        },
-        el(
-          'button',
-          {
-            type: 'button',
-            className: 'is-row',
-            onClick: () => {
-              setSelected('')
-              setView('gallery')
-            },
-            style: {
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              // flex:1 like Notes' search input, not width:100% -- so it shares
-              // the row correctly if a second control lands beside it.
-              flex: 1,
-              minWidth: 0,
-              height: '30px',
-              boxSizing: 'border-box',
-              padding: '0 10px',
-              borderRadius: '8px',
-              background: view === 'gallery' ? ACCENT_BG : CARD,
-              border: `1px solid ${view === 'gallery' ? ACCENT : BORDER}`,
-              color: view === 'gallery' ? TEXT : MUTED,
-              fontSize: '12px',
-              fontFamily: FONT_BODY,
-              cursor: 'pointer',
-              textAlign: 'left',
-            },
-          },
-          [
-            el(Grid, { size: 13 }, undefined, 'i'),
-            el('span', { style: { flex: 1 } }, 'All icons', 'l'),
-            el(
-              'span',
-              { style: { fontSize: '10px', color: MUTED } },
-              String(library ? library.iconCount : 0),
-              'c',
-            ),
-          ],
-        ),
-        'gallerybtn',
-      ),
       // request list
       el(
         'div',
@@ -1765,6 +1745,109 @@ export default function IconStudio() {
               'No requests in this library yet.',
             ),
         'list',
+      ),
+      // Bottom bar, in the slot Notes gives its Settings row: a separator, then
+      // one full-width primary control plus a 30x30 icon button -- the geometry of
+      // Notes' search + sort pair, moved to the foot of the panel.
+      //
+      // paddingTop is 6px, not Notes' 8px, and that 2px is load-bearing. Notes
+      // seats a 28px row here; these are 30px controls (the search row's height,
+      // which you asked to match). Both cards share a grid row with the dashboard
+      // left nav and both end 8px above the pane, so the budget below this border
+      // has to equal Notes' for the separators to land on one baseline:
+      // 6 + 30 + 8 == 8 + 28 + 8 == 44px of content. Measured against Notes' own
+      // panel it reads 46px from separator to panel floor for both, the extra 2px
+      // being this wrapper's border and the panel's own bottom border.
+      el(
+        'div',
+        {
+          style: {
+            flexShrink: 0,
+            marginTop: '4px',
+            borderTop: `1px solid ${BORDER_STRONG}`,
+            marginBottom: '8px',
+            display: 'flex',
+            gap: '6px',
+            alignItems: 'center',
+            padding: '6px 12px 0',
+          },
+        },
+        [
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'is-row',
+              onClick: () => {
+                setSelected('')
+                setView('gallery')
+              },
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                // flex:1 like Notes' search input, not width:100%, so it shares
+                // the row with the folder button.
+                flex: 1,
+                minWidth: 0,
+                height: '30px',
+                boxSizing: 'border-box',
+                padding: '0 10px',
+                borderRadius: '8px',
+                background: view === 'gallery' ? ACCENT_BG : CARD,
+                border: `1px solid ${view === 'gallery' ? ACCENT : BORDER}`,
+                color: view === 'gallery' ? TEXT : MUTED,
+                fontSize: '12px',
+                fontFamily: FONT_BODY,
+                cursor: 'pointer',
+                textAlign: 'left',
+              },
+            },
+            [
+              el(Grid, { size: 13 }, undefined, 'i'),
+              el('span', { style: { flex: 1 } }, 'All icons', 'l'),
+              el(
+                'span',
+                { style: { fontSize: '10px', color: MUTED } },
+                String(library ? library.iconCount : 0),
+                'c',
+              ),
+            ],
+            'gallery',
+          ),
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'is-act',
+              onClick: revealFolder,
+              disabled: !library || revealing,
+              // The path is in the title rather than the label: the button has to
+              // stay 30px wide, and a truncated path tells you less than nothing.
+              title: library
+                ? `Open ${library.outputPath} in Finder`
+                : 'Open the library folder',
+              'aria-label': 'Open the library folder',
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '30px',
+                height: '30px',
+                flexShrink: 0,
+                boxSizing: 'border-box',
+                borderRadius: '8px',
+                background: CARD,
+                border: `1px solid ${BORDER}`,
+                color: MUTED,
+                cursor: library && !revealing ? 'pointer' : 'default',
+              },
+            },
+            el(Folder, { size: 14 }),
+            'folder',
+          ),
+        ],
+        'bottombar',
       ),
       el(
         'div',
@@ -1827,6 +1910,7 @@ export default function IconStudio() {
           el(IconGrid, {
             icons: galleryIcons,
             canvas: library?.params?.canvas,
+            single: true,
           }),
         )
       : // One empty state, not two. The gallery IS the library's landing page, so

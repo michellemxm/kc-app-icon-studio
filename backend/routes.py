@@ -68,6 +68,7 @@ from .contact_sheet import (  # noqa: E402
     proof_path,
     workspace_dir,
 )
+from .reveal import RevealError, reveal_binary, reveal_folder  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ def register_routes(ctx: Any) -> list[AppRoute]:
         AppRoute("PATCH", "/libraries/{lib_id}", patch_library),
         AppRoute("GET", "/libraries/{lib_id}/icons", get_library_icons),
         AppRoute("POST", "/libraries/{lib_id}/redraw", redraw_library),
+        AppRoute("POST", "/libraries/{lib_id}/reveal", reveal_library_folder),
         AppRoute("POST", "/jobs", create_job),
         AppRoute("POST", "/jobs/{job_id}/render", render_sheet),
         AppRoute("GET", "/jobs/{job_id}/proof", get_proof),
@@ -229,6 +231,52 @@ async def patch_library(request: web.Request, ctx: Any) -> web.Response:
         return web.json_response({"error": "no such library"}, status=404)
     state = await asyncio.to_thread(store.load_state)
     return web.json_response({"library": store.public_library(state, lib)})
+
+
+async def reveal_library_folder(request: web.Request, ctx: Any) -> web.Response:
+    """Open a library's output folder in the OS file manager.
+
+    Takes NO path. The directory is derived from the library record, so nothing a
+    caller sends can point this at another folder -- which matters more here than
+    usual, because the app's Python runs in-process with the gateway's privileges
+    and this is the one route that hands a path to another program.
+
+    A missing folder is reported, not recreated. The user may have deleted or
+    moved it deliberately; conjuring an empty one to show would be a lie about
+    where their icons are, and the honest answer points them at Library
+    parameters to repoint it.
+    """
+    denied = _unauthorized(request)
+    if denied:
+        return denied
+    lib_id = request.match_info.get("lib_id", "")
+    library = await asyncio.to_thread(store.get_library, lib_id)
+    if library is None:
+        return web.json_response({"error": "no such library"}, status=404)
+
+    path = store.library_output_dir(library)
+    if reveal_binary() is None:
+        return web.json_response(
+            {"error": "opening a folder is not supported on this system"}, status=501
+        )
+    if not await asyncio.to_thread(path.is_dir):
+        return web.json_response(
+            {
+                "ok": True,
+                "opened": False,
+                "missing": True,
+                "path": str(path),
+                "error": "that folder no longer exists",
+            },
+            status=404,
+        )
+
+    try:
+        await asyncio.to_thread(reveal_folder, path)
+    except RevealError as exc:
+        return web.json_response({"error": str(exc)}, status=exc.status)
+    logger.info("Icon Studio: revealed %s for library %s", path, lib_id)
+    return web.json_response({"ok": True, "opened": True, "path": str(path)})
 
 
 async def get_library_icons(request: web.Request, ctx: Any) -> web.Response:
