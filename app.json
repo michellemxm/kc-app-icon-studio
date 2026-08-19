@@ -12,6 +12,11 @@
     "A per-workspace metaphor ledger stops two icons in a set from resolving to the same silhouette"
   ],
   "defaultEnabled": false,
+  "iconUrl": "/apps/icon-studio/ui/icon.svg",
+  "heroImage": "/apps/icon-studio/ui/hero-light.svg",
+  "heroImageDark": "/apps/icon-studio/ui/hero-dark.svg",
+  "heroImageDetail": "/apps/icon-studio/ui/hero-detail-light.svg",
+  "heroImageDetailDark": "/apps/icon-studio/ui/hero-detail-dark.svg",
   "platform": {
     "os": ["macos", "linux"]
   },
